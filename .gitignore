@@ -1,0 +1,16 @@
+.DS_Store
+*.iso
+*.qcow2
+*.raw
+*.img
+*.vmdk
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+kubeconfig
+.kube/
+/csb-fedora44/

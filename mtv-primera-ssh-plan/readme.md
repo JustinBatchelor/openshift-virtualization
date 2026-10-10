@@ -1,5 +1,7 @@
 # Enable MTV 2.12 storage copy offload on HPE Primera using SSH
 
+For the named `vmware-vcenter`, `host`, and `hpe-thin` resources, see the [command reference](#appendix-command-reference-for-vmware-vcenter-and-hpe-thin).
+
 ## 1. Verify storage placement and prerequisites
 
 Use the existing MTV installation, VMware provider, and HPE CSI StorageClass for a single-VM cold migration pilot. **Same-array placement is unverified and must be demonstrated before enabling offload.**
@@ -780,3 +782,146 @@ Keep an inventory of reused versus pilot-created maps and Secrets. Cleanup must 
 Expand to small batches after pilot acceptance. Repeat storage-placement verification whenever source datastores or destination CSI backends change.
 
 **Defaults:** MTV 2.12, MTV-generated SSH keys, reuse of the existing Primera CSI StorageClass, inspection and reuse of suitable ownerless maps, separate copies when ownership or offload settings require them, one cold pilot, isolated validation networking, and TLS verification enabled. **Same-array placement remains a required verification—not an assumption.** No cluster changes or migrations have been performed.
+
+## Appendix: Command reference for vmware-vcenter and hpe-thin
+
+These examples use source Provider `vmware-vcenter`, destination Provider `host`, namespace `openshift-mtv`, and existing StorageClass `hpe-thin`. Confirm these names and complete the same-array checks in section 1 before enabling offload. Replace every angle-bracket placeholder before use. The SSH tests below require a build-matched restricted wrapper that accepts `DS=;CMD=...`; they do not replace the Python wrapper tests in section 2.5.
+
+### Patch Provider (SSH)
+
+```bash
+oc patch providers.forklift.konveyor.io vmware-vcenter \
+  -n openshift-mtv --type=merge \
+  -p '{"spec":{"settings":{"esxiCloneMethod":"ssh"}}}'
+```
+
+### Enable Copy Offload
+
+```bash
+oc patch forkliftcontrollers.forklift.konveyor.io forklift-controller \
+  -n openshift-mtv --type=merge \
+  -p '{"spec":{"feature_copy_offload":"true"}}'
+```
+
+### Add Hardware Specific Backend
+
+Use this manifest for the dedicated MTV offload Secret, following the ownership and credential handling in section 3.2. The requested `"true"` value disables array TLS certificate verification for this example; the main procedure defaults to `"false"` with certificate trust configured.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: primera-offload
+  namespace: openshift-mtv
+type: Opaque
+stringData:
+  STORAGE_HOSTNAME: "https://<verified-primera-management-address>:443"
+  STORAGE_USERNAME: "<array-user>"
+  STORAGE_PASSWORD: "<array-password>"
+  STORAGE_SKIP_SSL_VERIFICATION: "true"
+```
+
+### Query Provider
+
+```bash
+oc get provider vmware-vcenter -n openshift-mtv \
+  -o jsonpath='{range .status.conditions[?(@.type=="SSHNotReady")]}{.suggestion}{"\n"}{end}'
+```
+
+Review any returned suggestion and complete the matching wrapper and restricted public-key installation on each participating ESXi host before testing. Empty output alone does not prove SSH readiness.
+
+### Extract Private Key
+
+Use `.data.private-key` for the private Secret; `.data.public-key` is the field in the public Secret. See [Red Hat's generated SSH key fields](https://docs.redhat.com/en/documentation/migration_toolkit_for_virtualization/2.12/html/planning_your_migration_to_red_hat_openshift_virtualization/assembly_planning-migration-vmware_mtv).
+
+Run in a private local working directory, with shell tracing disabled:
+
+```bash
+umask 077
+oc get secret offload-ssh-keys-vmware-vcenter-private \
+  -o jsonpath='{.data.private-key}' -n openshift-mtv | base64 -d > esxi_private_key
+```
+
+### Update Permissions Private Key
+
+```bash
+chmod 600 esxi_private_key
+ssh-keygen -y -f esxi_private_key > /dev/null
+```
+
+Stop if extraction or key validation fails.
+
+### First Pass SSH Test
+
+Replace `<update-me-ip>` with the participating ESXi management address. Verify its host-key fingerprint before accepting the first connection. Confirm the installed wrapper accepts this command format, including the empty `DS` value, before using these tests.
+
+```bash
+ssh -T \
+  -o IdentitiesOnly=yes \
+  -o BatchMode=no \
+  -o StrictHostKeyChecking=ask \
+  -o PreferredAuthentications=publickey \
+  -i esxi_private_key 'root@<update-me-ip>' \
+  'DS=;CMD=status test-task-id'
+```
+
+### Final SSH Test
+
+```bash
+ssh -T -o IdentitiesOnly=yes -o BatchMode=yes \
+  -i esxi_private_key 'root@<update-me-ip>' \
+  'DS=;CMD=status test-task-id'
+```
+
+`test-task-id` is a synthetic status query, not a migration task. Inspect the wrapper response; an unknown-task response must be distinguished from authentication, host-key, or command-format failures. These tests do not establish XCOPY use. After testing every participating host, remove the local private-key copy:
+
+```bash
+rm -f esxi_private_key
+```
+
+### Create Storage Map
+
+Use a new map name and follow section 3's ownership checks. Replace the three datastore placeholders with distinct VMware datastore managed-object reference IDs (for example, `datastore-123`), not VMFS UUIDs. Keep one entry per required datastore and remove unused entries. Confirm `hpe-thin` is the verified existing Primera StorageClass.
+
+```yaml
+apiVersion: forklift.konveyor.io/v1beta1
+kind: StorageMap
+metadata:
+  name: primera-offload-<datastore-name>
+  namespace: openshift-mtv
+spec:
+  provider:
+    source:
+      name: vmware-vcenter
+      namespace: openshift-mtv
+    destination:
+      name: host
+      namespace: openshift-mtv
+  map:
+    - source:
+        id: <vmware-datastore-moRefID-1>
+      destination:
+        storageClass: hpe-thin
+      offloadPlugin:
+        vsphereXcopyConfig:
+          secretRef: primera-offload
+          storageVendorProduct: primera3par
+    - source:
+        id: <vmware-datastore-moRefID-2>
+      destination:
+        storageClass: hpe-thin
+      offloadPlugin:
+        vsphereXcopyConfig:
+          secretRef: primera-offload
+          storageVendorProduct: primera3par
+    - source:
+        id: <vmware-datastore-moRefID-3>
+      destination:
+        storageClass: hpe-thin
+      offloadPlugin:
+        vsphereXcopyConfig:
+          secretRef: primera-offload
+          storageVendorProduct: primera3par
+```
+
+Record the new map name in `STORAGE_MAP_NAME` when continuing to the pilot in section 4.
